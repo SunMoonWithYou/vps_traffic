@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic/main/ins
 或使用 `wget`：
 
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic/main/install.sh && chmod +x vps_traffic.sh && sudo ./install.sh
+wget -O install.sh https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic/main/install.sh && chmod +x install.sh && sudo ./install.sh
 ```
 
 也可以直接运行：
