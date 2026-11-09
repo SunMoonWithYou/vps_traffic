@@ -1,55 +1,100 @@
-# VPS 流量统计 & Telegram 日报管理工具
+<p align="center">
+  <img src="banner.png" width="100%" alt="vnStat 流量统计 & Telegram 日报管理工具">
+</p>
 
-基于 `vnStat` + `Telegram Bot` 的 VPS 流量统计与日报推送脚本，支持一键安装、菜单管理、定时发送、周期累计、限额进度条等功能。
+# 📊 vnStat 流量统计 & Telegram 日报管理工具
 
----
+一个基于 **vnStat + Bash + Telegram Bot** 的轻量级服务器流量统计工具。
 
-## 一键安装
+自动读取服务器网卡流量数据，每天定时生成流量日报，并通过 Telegram Bot 推送到指定聊天窗口。支持自定义流量统计模式、月度流量周期、流量限额及进度显示。
+
+无需复杂的数据库和 Web 服务，安装配置后即可自动运行。
+
+## ✨ 功能特点
+
+- **📊 每日流量统计**：自动读取 vnStat 数据，统计昨日下载、上传及流量合计。
+- **🤖 Telegram 自动推送**：每天定时发送流量日报，无需手动查询。
+- **📈 多种流量模式**：支持入站+出站、仅入站、仅出站、入出站取大四种统计方式。
+- **📅 自定义月度周期**：支持自定义每月流量重置日期，例如每月 1 号、15 号。
+- **🎯 流量限额监控**：设置月度流量限额，自动计算已使用流量和使用百分比。
+- **📊 可视化进度条**：通过颜色区分流量使用情况，直观查看剩余流量。
+- **🌐 多网卡支持**：可指定需要统计的网络接口。
+- **⏰ 定时任务管理**：自动配置 Cron，每天按照指定时间发送日报。
+- **🛠️ 交互式管理菜单**：支持安装、修改配置、更新脚本、测试发送和彻底卸载。
+
+## 📈 Telegram 日报示例
+
+```text
+📊 流量日报
+
+💻主机：服务器名称
+🛜 地址： 1.2.3.4
+
+⬇️ 下载： 12.50 GB
+⬆️ 上传： 3.20 GB
+📈 模式： 入+出
+
+🧮 合计： 15.70 GB
+
+📅 周期： 2026-11-01 ~ 2026-11-30
+🔄 重置： 每月 1 号
+
+⏳ 累计： 125.60 / 1000 GB
+🎯 进度： 🟩🟩⬜⬜⬜⬜⬜⬜⬜⬜ 12%
+
+🕙 2026-11-09 01:30
+```
+
+## 📊 流量统计模式
+
+支持以下四种统计方式：
+
+| 模式 | 名称 | 统计规则 |
+|---|---|---|
+| 1 | 入+出 | 下载流量 + 上传流量 |
+| 2 | 仅入站 | 只统计下载流量 |
+| 3 | 仅出站 | 只统计上传流量 |
+| 4 | 入/出取大 | 每日下载和上传取较大值 |
+
+可以根据服务器商家的流量计费规则选择对应模式。
+
+## ⚙️ 配置说明
+
+安装时需要填写以下参数：
+
+| 参数 | 说明 |
+|---|---|
+| 主机别名 | Telegram 日报中显示的服务器名称 |
+| Bot Token | Telegram Bot API Token |
+| Chat ID | 接收日报的 Telegram 用户或群组 ID |
+| 重置日 | 每月流量周期的起始日期（1-31） |
+| 限额（GB） | 每月流量使用上限 |
+| 网卡 | 需要统计的网络接口，例如 eth0、ens3 |
+| 时间 | 每天发送日报的时间，格式 HH:MM |
+| 流量模式 | 选择四种流量统计方式之一 |
+
+## 🚀 安装使用
+
+### 1. 安装脚本
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic/main/install.sh)
 ```
+根据菜单提示进行操作。
 
----
+### 2. 完成配置
 
-## 功能特性
+选择：
 
-- 自动检查并安装依赖：`vnstat`、`bc`、`curl`、`cron`
-- 自动启用 `vnstat` 与 `cron` 服务
-- 统计昨日上传、下载、合计流量
-- 支持 4 种流量统计模式：
-  - `1` 入 + 出
-  - `2` 仅入站
-  - `3` 仅出站
-  - `4` 入 / 出每日取大
-- 支持自定义每月重置日
-- 支持设置月流量限额，并生成 Telegram 进度条
-- 支持 Telegram Bot 日报推送
-- 支持 Markdown 格式消息
-- 自动写入 `crontab` 定时任务
-- 提供中文菜单管理：
-  - 全新安装
-  - 修改配置参数
-  - 仅更新脚本逻辑
-  - 手动发送测试报表
-  - 彻底卸载
-  - 退出
+```text
+1. 全新安装 (配置+逻辑)
+```
 
----
+按照提示填写 Telegram Bot、Chat ID、流量限额、网卡及发送时间。
 
-## 支持系统
+配置完成后，脚本会自动安装所需依赖、生成日报程序并添加每日定时任务。
 
-- Debian / Ubuntu
-- CentOS / RHEL
-
-建议使用 `root` 用户或具有 `sudo` 权限的用户运行。  
-系统需要支持 `systemd`、`cron`，并且已正确识别网卡。
-
----
-
-## 使用方法
-
-运行主脚本后，会显示如下菜单：
+## 🛠️ 管理菜单
 
 ```text
 ===========================================
@@ -64,195 +109,59 @@ bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/vps_traffic/m
 ===========================================
 ```
 
-首次使用请选择 `1` 进行全新安装。
-
----
-
-## 配置说明
-
-安装过程中会要求填写以下参数：
-
-| 配置项 | 说明 |
+| 菜单 | 功能 |
 |---|---|
-| `HOST_ALIAS` | 主机别名，显示在 Telegram 日报中 |
-| `TG_TOKEN` | Telegram Bot Token |
-| `TG_CHAT_ID` | Telegram Chat ID |
-| `RESET_DAY` | 每月流量重置日，范围 `1-31` |
-| `MAX_GB` | 月流量限额，单位 GB |
-| `INTERFACE` | 网卡名称，默认自动读取默认路由网卡 |
-| `RUN_TIME` | 每日发送时间，格式 `HH:MM`，例如 `01:30` |
-| `TRAFFIC_MODE` | 流量统计模式：`1` 入+出，`2` 仅入站，`3` 仅出站，`4` 入/出取大 |
+| 1 | 安装环境、配置参数并生成日报脚本 |
+| 2 | 修改配置参数并重新生成定时任务 |
+| 3 | 仅更新日报脚本逻辑，保留现有配置 |
+| 4 | 手动执行并发送测试日报 |
+| 5 | 删除定时任务、日报脚本及配置文件 |
+| 6 | 退出管理菜单 |
 
-配置文件保存位置：
+## 📂 文件说明
 
-```bash
-/etc/vnstat_tg.conf
-```
+| 文件路径 | 用途 |
+|---|---|
+| `/etc/vnstat_tg.conf` | 配置文件 |
+| `/usr/local/bin/vnstat_tg_report.sh` | 日报执行脚本 |
+| Crontab | 每日定时发送任务 |
 
-报表执行脚本保存位置：
+## 📦 运行环境
 
-```bash
-/usr/local/bin/vnstat_tg_report.sh
-```
+- Linux 服务器
+- Debian / Ubuntu
+- CentOS / RHEL 系列
+- Bash
+- vnStat
+- bc
+- curl
+- cron / cronie
+- Telegram Bot
 
-定时任务示例：
+## ⚠️ 注意事项
 
-```bash
-30 1 * * * /bin/bash /usr/local/bin/vnstat_tg_report.sh
-```
+1. 首次安装建议使用 root 权限运行，确保依赖安装、配置写入及定时任务创建正常。
+2. 使用前需要提前创建 Telegram Bot，并获取 Bot Token 和 Chat ID。
+3. 确保服务器能够正常连接 Telegram API。
+4. vnStat 需要一定时间采集流量数据，刚安装时历史流量可能不完整。
+5. 请确认选择的网卡是实际需要统计的网络接口。
+6. 流量统计依赖 vnStat 已记录的数据，统计结果可能与服务商后台存在差异。
+7. 请妥善保管配置文件，其中包含 Telegram Bot Token，不要公开上传到 GitHub。
 
-查看当前定时任务：
+## 🔄 版本信息
 
-```bash
-crontab -l
-```
+**当前版本：v3.1**
 
----
+- 支持四种流量统计模式。
+- 支持自定义月度流量周期。
+- 支持自定义流量限额。
+- 支持 Telegram 每日自动日报。
+- 支持定时任务自动配置。
+- 支持交互式安装和管理。
 
-## Telegram Bot 准备
+## ❤️ 鸣谢
 
-1. 在 Telegram 中找到 `@BotFather`
-2. 创建 Bot，获取 `Bot Token`
-3. 获取 `Chat ID`
-   - 私聊：可以先给 Bot 发送一条消息，然后访问：
-     ```text
-     https://api.telegram.org/bot<你的TOKEN>/getUpdates
-     ```
-   - 也可以使用 `@userinfobot` 获取自己的 Chat ID
-   - 群组：将 Bot 拉入群组，并给予发言权限，群组 Chat ID 通常为负数
-4. 将 `TG_TOKEN` 和 `TG_CHAT_ID` 填入安装配置中
+- [vnStat](https://github.com/vergoh/vnstat) — 网络流量统计工具
+- [Telegram Bot API](https://core.telegram.org/bots/api) — Telegram 消息推送接口
 
----
-
-## 日报内容示例
-
-Telegram 日报大致包含以下内容：
-
-```text
-📊 流量日报
-
-💻主机：xxxx
-🛜 地址：x.x.x.x
-
-⬇️ 下载：x.xx GB
-⬆️ 上传：x.xx GB
-📈 模式：入+出
-
-🧮 合计：x.xx GB
-
-📅 周期：2025-01-01 ~ 2025-01-31
-🔄 重置：每月 1 号
-
-⏳ 累计：x.xx / xxx GB
-🎯 进度：🟩🟩🟩⬜⬜⬜⬜⬜⬜⬜ 30%
-
-🕙 2025-01-01 01:30
-```
-
----
-
-## 项目结构
-
-```text
-vps_traffic/
-├── README.md
-└── vps_traffic.sh
-```
-
-其中 `vps_traffic.sh` 为本项目主管理脚本。
-
----
-
-## 卸载
-
-可以在菜单中选择 `5. 彻底卸载`。
-
-也可以手动卸载：
-
-```bash
-crontab -l | grep -v '/usr/local/bin/vnstat_tg_report.sh' | crontab -
-sudo rm -f /usr/local/bin/vnstat_tg_report.sh /etc/vnstat_tg.conf
-```
-
----
-
-## 常见问题
-
-### 1. 收不到 Telegram 消息
-
-请检查：
-
-- `TG_TOKEN` 是否正确
-- `TG_CHAT_ID` 是否正确
-- Bot 是否被用户拉黑
-- 群组中 Bot 是否有发言权限
-- 服务器是否能访问 `api.telegram.org`
-
-### 2. 流量显示为 0
-
-请检查：
-
-- 网卡名称是否正确
-- `vnstat` 是否已初始化
-- 执行 `vnstat -d` 是否有昨日数据
-- 系统时间、时区是否正确
-
-查看时区：
-
-```bash
-timedatectl
-```
-
-### 3. vnStat 没有数据
-
-可以手动更新：
-
-```bash
-sudo vnstat -i 你的网卡 --update
-```
-
-查看状态：
-
-```bash
-vnstat -i 你的网卡
-```
-
-### 4. 安装依赖失败
-
-请确认：
-
-- 系统软件源可用
-- 当前用户有 `root` 或 `sudo` 权限
-- 服务器网络正常
-
----
-
-## 安全提示
-
-- `/etc/vnstat_tg.conf` 中保存了 Telegram Bot Token，请勿泄露。
-- 建议设置权限：
-  ```bash
-  sudo chmod 600 /etc/vnstat_tg.conf
-  ```
-- 不要将真实 Token、Chat ID 提交到 GitHub 仓库。
-- 本脚本会安装依赖、修改 `crontab`、创建系统文件，请先在测试环境验证。
-
----
-
-## 贡献
-
-欢迎提交 Issue 或 Pull Request。
-
-如果这个项目对你有帮助，欢迎给一个 Star ⭐
-
----
-
-## License
-
-MIT License
-
----
-
-## 致谢
-
-感谢 `vnStat`、`Telegram Bot API` 以及所有开源项目。
+如果这个项目对你有帮助，欢迎 Star ⭐ 支持！
