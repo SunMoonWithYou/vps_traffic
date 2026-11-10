@@ -188,7 +188,7 @@ collect_hourly() {
 
     local target_line=""
     local count=${#lines[@]}
-    # 取倒数第二条（上一个完整小时），跳过当前未完成的小时
+    # 取倒数第二条（上一个完整小时）
     if [ "$count" -ge 2 ]; then
         target_line="${lines[$((count-2))]}"
     elif [ "$count" -eq 1 ]; then
@@ -196,18 +196,14 @@ collect_hourly() {
     fi
 
     if [ -n "$target_line" ]; then
-        local hour=$(echo "$target_line" | grep -oE '[0-9]{2}:[0-9]{2}' | head -1)
-        local h=$(echo "$hour" | cut -d: -f1)
-        local m=$(echo "$hour" | cut -d: -f2)
-        local new_h=$((10#$h + BJ_DIFF))
-
-        # 跨天处理
-        if [ "$new_h" -ge 24 ]; then
-            new_h=$((new_h - 24))
-        elif [ "$new_h" -lt 0 ]; then
-            new_h=$((new_h + 24))
+        # 直接用当前北京时间的上一个小时作为标签
+        # 避免 vnstat 小时与时区转换的偏差
+        local bj_hour=$(TZ=Asia/Shanghai date +%H)
+        local prev_h=$((10#$bj_hour - 1))
+        if [ "$prev_h" -lt 0 ]; then
+            prev_h=23
         fi
-        hour=$(printf "%02d:%s" "$new_h" "$m")
+        local hour=$(printf "%02d:00" "$prev_h")
 
         local rx=$(echo "$target_line" | grep -oE '[0-9.]+[[:space:]]*[KMG]?i?B' | sed -n '1p')
         local tx=$(echo "$target_line" | grep -oE '[0-9.]+[[:space:]]*[KMG]?i?B' | sed -n '2p')
