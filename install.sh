@@ -419,7 +419,7 @@ EOF
 
     # 每小时实时上报
     if [ "$HOURLY_REPORT" = "1" ]; then
-        (crontab -l 2>/dev/null | grep -Fv "hourly"; echo "0 * * * * /bin/bash $BIN_PATH hourly") | crontab -
+        (crontab -l 2>/dev/null | grep -Fv "hourly"; echo "10 * * * * /bin/bash $BIN_PATH hourly") | crontab -
         echo "🚀 立即执行一次实时上报..."
         /bin/bash "$BIN_PATH" hourly
     else
