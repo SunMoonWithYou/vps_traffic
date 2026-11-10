@@ -196,14 +196,16 @@ collect_hourly() {
     fi
 
     if [ -n "$target_line" ]; then
-        # 直接用当前北京时间的上一个小时作为标签
-        # 避免 vnstat 小时与时区转换的偏差
-        local bj_hour=$(TZ=Asia/Shanghai date +%H)
-        local prev_h=$((10#$bj_hour - 1))
-        if [ "$prev_h" -lt 0 ]; then
-            prev_h=23
+        # 从 vnstat 行解析实际小时，再转北京时间
+        local raw_hour=$(echo "$target_line" | grep -oE '[0-9]{2}:[0-9]{2}' | head -1)
+        local h=$(echo "$raw_hour" | cut -d: -f1)
+        local new_h=$((10#$h + BJ_DIFF))
+        if [ "$new_h" -ge 24 ]; then
+            new_h=$((new_h - 24))
+        elif [ "$new_h" -lt 0 ]; then
+            new_h=$((new_h + 24))
         fi
-        local hour=$(printf "%02d:00" "$prev_h")
+        local hour=$(printf "%02d:00" "$new_h")
 
         local rx=$(echo "$target_line" | grep -oE '[0-9.]+[[:space:]]*[KMG]?i?B' | sed -n '1p')
         local tx=$(echo "$target_line" | grep -oE '[0-9.]+[[:space:]]*[KMG]?i?B' | sed -n '2p')
@@ -224,27 +226,16 @@ HOURLY_DATA=$(collect_hourly)
 
 # ---------- 计算流量 ----------
 if [ "$REPORT_TYPE" = "hourly" ]; then
-    # 实时上报：统计到今天
+    # 实时上报：周期累计，今日由 Worker 累加
     TODAY_TS=$(date +%s)
     TOTAL_MB=$(calc_period "$TODAY_TS")
     USED_GB=$(fix_zero $(echo "scale=2;$TOTAL_MB/1024" | $BC))
     PCT=$(echo "scale=0;$USED_GB*100/$MAX_GB" | $BC 2>/dev/null)
     [ -z "$PCT" ] && PCT=0
 
-    TODAY_D_FULL=$(date +%Y-%m-%d)
-    TODAY_LINE=$(echo "$all_daily" | grep -E "$TODAY_D_FULL|$(date +%m/%d/%y)|$(date +%d.%m.%y)" | head -1)
-    if [ -n "$TODAY_LINE" ]; then
-        T_RX=$(get_traffic "$TODAY_LINE" 1)
-        T_TX=$(get_traffic "$TODAY_LINE" 2)
-        DISP_RX="${T_RX/GiB/GB}"
-        DISP_TX="${T_TX/GiB/GB}"
-        TODAY_TOTAL=$(echo "$(val_to_mb "$T_RX") + $(val_to_mb "$T_TX")" | $BC)
-        TODAY_GB=$(fix_zero $(echo "scale=2;$TODAY_TOTAL/1024" | $BC))
-    else
-        DISP_RX="0.00 GB"
-        DISP_TX="0.00 GB"
-        TODAY_GB="0.00"
-    fi
+    DISP_RX="-"
+    DISP_TX="-"
+    TODAY_GB="-"
     TITLE="流量实时上报"
     YEST_GB="-"
 else
@@ -282,17 +273,42 @@ fi
 
 # ---------- 发送 Telegram（仅日报）----------
 if [ "$REPORT_TYPE" = "daily" ]; then
-    MSG=$(printf "📊 *%s*\n\n💻主机：*%s*\n🛜 地址： \`%s\`\n\n⬇️ 下载： \`%s\`\n⬆️ 上传： \`%s\`\n📈 模式： \`%s\`\n\n🧮 昨日： \`%s GB\`\n📅 今日： \`%s GB\`\n\n📅 周期： \`%s ~ %s\`\n🔄 重置： 每月 %s 号\n\n⏳ 累计： \`%s / %s GB\`\n🎯 进度： \`%d%%\`\n\n🕙 \`%s\`" \
-        "$TITLE" "$HOST_ALIAS" "$SERVER_IP" "$DISP_RX" "$DISP_TX" "$MODE_NAME" \
-        "$YEST_GB" "$TODAY_GB" "$START_DATE" "$END_DATE" "$RESET_DAY" "$USED_GB" "$MAX_GB" "$PCT" "$NOW")
+    # 进度条（根据进度用不同颜色）
+    BAR_LEN=10
+    FILLED=$((PCT * BAR_LEN / 100))
+    [ "$FILLED" -gt "$BAR_LEN" ] && FILLED=$BAR_LEN
+    EMPTY=$((BAR_LEN - FILLED))
+    # 颜色：<50% 绿，50-70% 黄，70-90% 橙，≥90% 红
+    if [ "$PCT" -ge 90 ]; then
+        BLOCK="🟥"
+    elif [ "$PCT" -ge 70 ]; then
+        BLOCK="🟧"
+    elif [ "$PCT" -ge 50 ]; then
+        BLOCK="🟨"
+    else
+        BLOCK="🟩"
+    fi
+    BAR=""
+    for ((i=0; i<FILLED; i++)); do BAR+="$BLOCK"; done
+    for ((i=0; i<EMPTY; i++)); do BAR+="⬜"; done
 
-    $CL --connect-timeout 10 --retry 3 -s \
+    MSG=$(printf "📊 *流量日报*\n\n💻 主机：*%s*\n🛜 地址：\`%s\`\n\n⬇️ 下载：\`%s\`\n⬆️ 上传：\`%s\`\n📈 模式：\`%s\`\n\n🧮 昨日：\`%s GB\`\n\n📅 周期：\`%s ~ %s\`\n🔄 重置：每月 %s 号\n\n⏳ 累计：\`%s / %s GB\`\n🎯 进度：%s \`%d%%\`\n\n🕙 \`%s\`" \
+        "$HOST_ALIAS" "$SERVER_IP" "$DISP_RX" "$DISP_TX" "$MODE_NAME" \
+        "$YEST_GB" "$START_DATE" "$END_DATE" "$RESET_DAY" "$USED_GB" "$MAX_GB" "$BAR" "$PCT" "$NOW")
+
+    RESP=$($CL --connect-timeout 10 --retry 3 -s \
         -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
-        -d "chat_id=$TG_CHAT_ID" \
-        -d "text=$MSG" \
+        --data-urlencode "chat_id=$TG_CHAT_ID" \
+        --data-urlencode "text=$MSG" \
         -d "parse_mode=Markdown" \
-        -d "disable_notification=true" >/dev/null
-    echo "✅ Telegram 日报已发送"
+        -d "disable_notification=true")
+    
+    if echo "$RESP" | grep -q '"ok":true'; then
+        echo "✅ Telegram 日报已发送"
+    else
+        echo "⚠️  发送失败："
+        echo "$RESP"
+    fi
 fi
 
 # ---------- 发送到 Worker（仅实时，带北京时间）----------
@@ -363,7 +379,7 @@ collect_config() {
     HOURLY_REPORT=${input_val:-${HOURLY_REPORT:-0}}
     [[ "$HOURLY_REPORT" != "1" ]] && HOURLY_REPORT=0
 
-    read -p "🌐 Worker 上报地址 (留空不启用) [${WORKER_URL}]: " input_val
+    read -p "🌐 Worker 上报地址 (完整路径) [${WORKER_URL}]: " input_val
     WORKER_URL=${input_val:-$WORKER_URL}
 
     read -p "🔑 上传密钥 (与 Worker 配置一致) [${UPLOAD_KEY}]: " input_val
