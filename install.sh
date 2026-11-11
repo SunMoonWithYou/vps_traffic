@@ -1,25 +1,32 @@
 #!/bin/bash
 # =================================================================
 # 名称: 流量统计 & TG 管理工具
-# 版本: v4.5
+# 版本: v4.6
 # 功能:
-#   - 每日 Telegram 流量日报
-#   - 每小时上报到 Cloudflare Worker（按北京时间小时）
+#   - 每日 Telegram 流量日报（含昨日真实下载/上传）
+#   - 每小时上报到 Cloudflare Worker（北京时间上一个完整小时）
 #   - 支持多种流量统计模式
 #   - 设备唯一编码
 #   - 自动日志轮转
 #   - 兼容任意服务器时区
+#
+# v4.6 变更:
+#   - 移除 vnstat JSON 解析分支（实测 vnStat 2.x 输出为单行 JSON，
+#     逐行解析不可行，且 --json 1 参数本身无效；统一使用文本输出）
+#   - 日报中「昨日/下载/上传」改为真实计算，不再固定 0.00
+#   - 小时数据解析仅在 hourly 模式执行，日报不再重复解析
+#   - 修复 calc_pct 除零、去除已弃用的 vnstat -u 调用
+#   - 配置录入增加 RESET_DAY/MAX_GB 合法性校验与默认值
+#   - 卸载时清理日志文件；cron 时间解析更健壮
+#   - 大幅减少解析过程中的子进程调用（grep 循环改为纯 bash 正则）
 # =================================================================
-VERSION="v4.5"
+VERSION="v4.6"
 CONFIG_FILE="/etc/vnstat_tg.conf"
 BIN_PATH="/usr/local/bin/vnstat_tg_report.sh"
 
 # ---------- 环境准备 ----------
 prepare_env() {
     echo "🔍 正在检查系统环境..."
-    local deps=("vnstat" "bc" "curl" "cron")
-
-    # 判断系统类型
     if [ -f /etc/debian_version ]; then
         PACKAGE_MANAGER="apt-get"
     elif [ -f /etc/redhat-release ]; then
@@ -29,17 +36,20 @@ prepare_env() {
         exit 1
     fi
 
-    # 安装缺失依赖
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &>/dev/null; then
-            echo "安装依赖: $dep"
-            if [ "$PACKAGE_MANAGER" = "apt-get" ]; then
-                sudo apt-get install -y "$dep"
-            else
-                sudo yum install -y "$dep"
-            fi
-        fi
+    local missing=()
+    local dep
+    for dep in vnstat bc curl; do
+        command -v "$dep" &>/dev/null || missing+=("$dep")
     done
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        if [ "$PACKAGE_MANAGER" = "apt-get" ]; then
+            sudo apt-get update -qq >/dev/null 2>&1
+            sudo apt-get install -y "${missing[@]}"
+        else
+            sudo yum install -y "${missing[@]}"
+        fi
+    fi
 
     # 确保 cron 服务存在
     if ! command -v cron &>/dev/null && ! command -v crond &>/dev/null; then
@@ -50,10 +60,9 @@ prepare_env() {
         fi
     fi
 
-    # 启动相关服务
+    # 启动相关服务（vnStat 2.x 依赖 vnstatd 守护进程采集数据）
     sudo systemctl enable cron --now >/dev/null 2>&1 || sudo systemctl enable crond --now >/dev/null 2>&1
     sudo systemctl enable vnstat --now >/dev/null 2>&1
-    sudo vnstat -u >/dev/null 2>&1
     echo "✅ 环境就绪"
 }
 
@@ -61,11 +70,12 @@ prepare_env() {
 # 优先使用 /etc/machine-id，其次网卡 MAC，最后随机
 generate_device_id() {
     local id=""
-    if [ -f /etc/machine-id ]; then
-        id=$(cat /etc/machine-id | tr -d '[:space:]' | head -c 32)
+    if [ -r /etc/machine-id ]; then
+        id=$(tr -d '[:space:]' < /etc/machine-id | head -c 32)
     fi
     if [ -z "$id" ] && [ -n "$INTERFACE" ]; then
-        local mac=$(cat /sys/class/net/"$INTERFACE"/address 2>/dev/null | tr -d ':' | head -c 12)
+        local mac
+        mac=$(tr -d ':' < "/sys/class/net/$INTERFACE/address" 2>/dev/null | head -c 12)
         [ -n "$mac" ] && id="mac_${mac}"
     fi
     if [ -z "$id" ]; then
@@ -76,9 +86,10 @@ generate_device_id() {
 
 # ---------- 生成实际上报脚本 ----------
 generate_report_logic() {
-    local BC_P=$(command -v bc)
-    local VN_P=$(command -v vnstat)
-    local CL_P=$(command -v curl)
+    local BC_P VN_P CL_P
+    BC_P=$(command -v bc)
+    VN_P=$(command -v vnstat)
+    CL_P=$(command -v curl)
 
     cat > "$BIN_PATH" << 'EOF'
 #!/bin/bash
@@ -91,7 +102,7 @@ log() {
 }
 
 # 日志轮转：超过 5MB 只保留最后 2000 行
-if [ -f "$LOG" ] && [ $(stat -c%s "$LOG" 2>/dev/null || echo 0) -gt 5242880 ]; then
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
     tail -n 2000 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
     log "日志已轮转"
 fi
@@ -111,12 +122,12 @@ fix_zero() {
     [[ $1 == .* ]] && echo "0$1" || echo "$1"
 }
 
-# 流量字符串转 MB（支持 MiB/GiB/KiB/MB/GB/KB）
+# 流量字符串转 MB（支持 TiB/TB/GiB/GB/MiB/MB/KiB/KB），纯 bash 提取数值
 val_to_mb() {
-    local raw=$(echo "$1" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
-    local num=$(echo "$raw" | grep -oE '[0-9.]+' | head -n1)
-    [ -z "$num" ] && num=0
-    local result
+    local raw=${1//[[:space:]]/}
+    raw=${raw^^}
+    local num=0 result
+    [[ $raw =~ ([0-9.]+) ]] && num=${BASH_REMATCH[1]}
     case "$raw" in
         *TIB*|*TB*) result=$(echo "scale=2;$num*1048576" | $BC) ;;
         *GIB*|*GB*) result=$(echo "scale=2;$num*1024" | $BC) ;;
@@ -125,14 +136,6 @@ val_to_mb() {
         *)          result="$num" ;;
     esac
     fix_zero "$result"
-}
-
-# 字节转 MB
-bytes_to_mb() {
-    local bytes=$1
-    [ -z "$bytes" ] || [ "$bytes" = "null" ] && bytes=0
-    local mb=$(echo "scale=2;$bytes/1048576" | $BC 2>/dev/null)
-    fix_zero "${mb:-0}"
 }
 
 # JSON 字符串转义
@@ -145,24 +148,18 @@ json_escape() {
     printf '%s' "$s"
 }
 
-# 安全计算百分比
+# 安全计算百分比（max 为 0 或非法时返回 0，避免除零）
 calc_pct() {
-    local used=$1 max=$2 pct
-    pct=$(echo "scale=0;$used*100/$max" | $BC 2>/dev/null)
+    local used=$1 max=$2 pct=0
+    if [ -n "$max" ] && [ "$max" != "0" ]; then
+        pct=$(echo "scale=0;$used*100/$max" | $BC 2>/dev/null)
+    fi
     pct=${pct:-0}
     [[ "$pct" =~ ^-?[0-9]+$ ]] || pct=0
     echo $((10#$pct))
 }
 
-# 检测 vnstat 是否支持 JSON
-USE_JSON=0
-if $VN --json 1 >/dev/null 2>&1; then
-    USE_JSON=1
-fi
-log "vnstat JSON 支持: $USE_JSON"
-
 # ---------- 初始化 ----------
-$VN -i "$INTERFACE" --update >/dev/null 2>&1
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
 # 计算当前计费周期起止日期
@@ -178,53 +175,31 @@ else
 fi
 log "计费周期: $START_DATE ~ $END_DATE"
 
-# 计算周期内累计流量（MB）——只解析一次日数据
+# 解析 vnstat 日数据到全局 DAY_MAP（日期 -> "rx串|tx串"，只解析一次）
+# 注意：必须声明为关联数组，否则日期下标会被当作算术表达式求值
+declare -A DAY_MAP
+load_daily() {
+    local line rest vals
+    while IFS= read -r line; do
+        [[ $line =~ ([0-9]{4}-[0-9]{2}-[0-9]{2}) ]] || continue
+        rest=${line#*"${BASH_REMATCH[1]}"}
+        mapfile -t vals < <(grep -oE '[0-9.]+[[:space:]]*[a-zA-Z/]+' <<< "$rest")
+        DAY_MAP["${BASH_REMATCH[1]}"]="${vals[0]:-0}|${vals[1]:-0}"
+    done < <($VN -d 2>/dev/null)
+    log "日数据解析完成，共 ${#DAY_MAP[@]} 条记录"
+}
+
+# 计算周期内累计流量（MB），按 TRAFFIC_MODE 聚合
 calc_period() {
-    local until_ts=$1
-    local total=0
-    declare -A day_map
-
-    if [ "$USE_JSON" = "1" ]; then
-        local json=$($VN -d --json 2>/dev/null)
-        while IFS= read -r line; do
-            if echo "$line" | grep -q '"year"'; then
-                local y=$(echo "$line" | grep -oE '"year":[0-9]+' | cut -d: -f2)
-                local m=$(echo "$line" | grep -oE '"month":[0-9]+' | cut -d: -f2)
-                local d=$(echo "$line" | grep -oE '"day":[0-9]+' | cut -d: -f2)
-                local rx=$(echo "$line" | grep -oE '"rx":[0-9]+' | cut -d: -f2)
-                local tx=$(echo "$line" | grep -oE '"tx":[0-9]+' | cut -d: -f2)
-                [ -z "$rx" ] && rx=0
-                [ -z "$tx" ] && tx=0
-                [ -n "$y" ] && day_map["$(printf '%04d-%02d-%02d' $y $m $d)"]="${rx}|${tx}|json"
-            fi
-        done <<< "$json"
-    else
-        local all_daily=$($VN -d 2>/dev/null)
-        while IFS= read -r line; do
-            local date_str=$(echo "$line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
-            [ -z "$date_str" ] && continue
-            local rx_s=$(echo "$line" | cut -c13- | grep -oE '[0-9.]+[[:space:]]*[a-zA-Z/]+' | sed -n '1p' | xargs)
-            local tx_s=$(echo "$line" | cut -c13- | grep -oE '[0-9.]+[[:space:]]*[a-zA-Z/]+' | sed -n '2p' | xargs)
-            day_map["$date_str"]="${rx_s}|${tx_s}|text"
-        done <<< "$all_daily"
-    fi
-
-    local cur_ts=$(date -d "$START_DATE" +%s)
+    local until_ts=$1 total=0 cur_ts d data rx tx rx_mb tx_mb add
+    cur_ts=$(date -d "$START_DATE" +%s)
     while [ "$cur_ts" -le "$until_ts" ]; do
-        local d=$(date -d "@$cur_ts" +%Y-%m-%d)
-        local data="${day_map[$d]}"
+        d=$(date -d "@$cur_ts" +%Y-%m-%d)
+        data="${DAY_MAP[$d]}"
         if [ -n "$data" ]; then
-            local rx=$(echo "$data" | cut -d'|' -f1)
-            local tx=$(echo "$data" | cut -d'|' -f2)
-            local typ=$(echo "$data" | cut -d'|' -f3)
-            local rx_mb tx_mb add=0
-            if [ "$typ" = "json" ]; then
-                rx_mb=$(bytes_to_mb "$rx")
-                tx_mb=$(bytes_to_mb "$tx")
-            else
-                rx_mb=$(val_to_mb "$rx")
-                tx_mb=$(val_to_mb "$tx")
-            fi
+            IFS='|' read -r rx tx _ <<< "$data"
+            rx_mb=$(val_to_mb "$rx")
+            tx_mb=$(val_to_mb "$tx")
             case "$TRAFFIC_MODE" in
                 2) add=$rx_mb ;;
                 3) add=$tx_mb ;;
@@ -233,9 +208,65 @@ calc_period() {
             esac
             total=$(echo "$total + $add" | $BC)
         fi
-        cur_ts=$((cur_ts + 86400))
+        cur_ts=$(date -d "$d +1 day" +%s)
     done
     echo "$total"
+}
+
+# 按某日的 rx/tx 数据计算单日流量（MB），返回到 MODE_ADD / MODE_RX_MB / MODE_TX_MB
+calc_day_mb() {
+    local data=$1
+    IFS='|' read -r MODE_RX_RAW MODE_TX_RAW _ <<< "$data"
+    MODE_RX_MB=$(val_to_mb "$MODE_RX_RAW")
+    MODE_TX_MB=$(val_to_mb "$MODE_TX_RAW")
+    case "$TRAFFIC_MODE" in
+        2) MODE_ADD=$MODE_RX_MB ;;
+        3) MODE_ADD=$MODE_TX_MB ;;
+        4) (( $(echo "$MODE_RX_MB > $MODE_TX_MB" | $BC -l) )) && MODE_ADD=$MODE_RX_MB || MODE_ADD=$MODE_TX_MB ;;
+        *) MODE_ADD=$(echo "$MODE_RX_MB + $MODE_TX_MB" | $BC) ;;
+    esac
+}
+
+# 采集上一个完整小时的流量（按北京时间输出），仅 hourly 模式调用
+collect_hourly() {
+    declare -A hour_map
+    local line cur_date="" vals hh rx tx
+
+    while IFS= read -r line; do
+        if [[ $line =~ ^[[:space:]]*([0-9]{4}-[0-9]{2}-[0-9]{2}) ]]; then
+            cur_date=${BASH_REMATCH[1]}
+        elif [[ $line =~ ^[[:space:]]*([0-9]{2}:[0-9]{2}) ]] && [ -n "$cur_date" ]; then
+            hh=${BASH_REMATCH[1]%%:*}
+            mapfile -t vals < <(grep -oE '[0-9.]+[[:space:]]*[KMG]?i?B' <<< "$line")
+            rx=${vals[0]:-0}
+            tx=${vals[1]:-0}
+            hour_map["${cur_date}_${hh}"]="$rx|$tx"
+        fi
+    done < <($VN -h 2>/dev/null)
+    log "小时数据解析完成，共 ${#hour_map[@]} 条记录"
+
+    # 北京时间上一个完整小时
+    local bj_ts=$(TZ=Asia/Shanghai date -d '1 hour ago' +%s)
+    bj_ts=$(( bj_ts - bj_ts % 3600 ))
+    local bj_date=$(TZ=Asia/Shanghai date -d "@$bj_ts" +%Y-%m-%d)
+    local bj_hour=$(printf "%02d:00" "$(TZ=Asia/Shanghai date -d "@$bj_ts" +%H)")
+
+    # 换算成服务器本地时间去查表
+    local local_ts=$((bj_ts - BJ_DIFF * 3600))
+    local key="$(date -d "@$local_ts" +%Y-%m-%d)_$(date -d "@$local_ts" +%H)"
+
+    local rx_mb=0 tx_mb=0 total_mb=0
+    if [ -n "${hour_map[$key]}" ]; then
+        IFS='|' read -r rx tx <<< "${hour_map[$key]}"
+        rx_mb=$(val_to_mb "$rx")
+        tx_mb=$(val_to_mb "$tx")
+        total_mb=$(fix_zero "$(echo "$rx_mb + $tx_mb" | $BC)")
+    else
+        log "未找到 $key 的小时数据，按 0 处理"
+    fi
+
+    log "上个小时: 北京时间 $bj_date $bj_hour (本地 $key) rx=${rx_mb}MB tx=${tx_mb}MB"
+    echo "[{\"key\":\"$bj_date $bj_hour\",\"date\":\"$bj_date\",\"hour\":\"$bj_hour\",\"rx_mb\":$rx_mb,\"tx_mb\":$tx_mb,\"total_mb\":$total_mb}]"
 }
 
 # 流量模式名称
@@ -246,10 +277,6 @@ case "$TRAFFIC_MODE" in
     *) MODE_NAME="入+出" ;;
 esac
 
-NOW=$(date "+%Y-%m-%d %H:%M")
-NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-BJ_NOW=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M")
-
 # 计算本地时区到北京时间的小时差
 LOCAL_OFFSET=$(date +%z)
 LOCAL_SIGN="${LOCAL_OFFSET:0:1}"
@@ -258,103 +285,19 @@ LOCAL_H=$((10#${LOCAL_OFFSET:1:2}))
 BJ_DIFF=$((8 - LOCAL_H))
 log "时区差值 BJ_DIFF=$BJ_DIFF 小时"
 
-# 采集当天北京时间已过去的所有完整小时流量（只解析一次）
-collect_hourly() {
-    local hours_json="["
-    local first=1
-    declare -A hour_map
+NOW=$(date "+%Y-%m-%d %H:%M")
+NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+BJ_NOW=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M")
 
-    # 一次性解析 vnstat 小时数据
-    if [ "$USE_JSON" = "1" ]; then
-        local json=$($VN -h --json 2>/dev/null)
-        local cur_date=""
-        while IFS= read -r line; do
-            if echo "$line" | grep -q '"date"'; then
-                local y=$(echo "$line" | grep -oE '"year":[0-9]+' | cut -d: -f2)
-                local m=$(echo "$line" | grep -oE '"month":[0-9]+' | cut -d: -f2)
-                local d=$(echo "$line" | grep -oE '"day":[0-9]+' | cut -d: -f2)
-                [ -n "$y" ] && cur_date=$(printf "%04d-%02d-%02d" "$y" "$m" "$d")
-            fi
-            if echo "$line" | grep -q '"hour"' && [ -n "$cur_date" ]; then
-                local h=$(echo "$line" | grep -oE '"hour":[0-9]+' | cut -d: -f2)
-                local rx=$(echo "$line" | grep -oE '"rx":[0-9]+' | cut -d: -f2)
-                local tx=$(echo "$line" | grep -oE '"tx":[0-9]+' | cut -d: -f2)
-                [ -z "$rx" ] && rx=0
-                [ -z "$tx" ] && tx=0
-                hour_map["${cur_date}_${h}"]="${rx}|${tx}|json"
-            fi
-        done <<< "$json"
-    else
-        local hourly_data=$($VN -h 2>/dev/null)
-        local cur_date=""
-        while IFS= read -r line; do
-            if echo "$line" | grep -qE '^[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}'; then
-                cur_date=$(echo "$line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
-                continue
-            fi
-            if echo "$line" | grep -qE '^[[:space:]]*[0-9]{2}:[0-9]{2}' && [ -n "$cur_date" ]; then
-                local hh=$(echo "$line" | grep -oE '[0-9]{2}:[0-9]{2}' | head -1 | cut -d: -f1)
-                local rx=$(echo "$line" | grep -oE '[0-9.]+[[:space:]]*[KMG]?i?B' | sed -n '1p')
-                local tx=$(echo "$line" | grep -oE '[0-9.]+[[:space:]]*[KMG]?i?B' | sed -n '2p')
-                [ -z "$rx" ] && rx="0"
-                [ -z "$tx" ] && tx="0"
-                hour_map["${cur_date}_${hh}"]="${rx}|${tx}|text"
-            fi
-        done <<< "$hourly_data"
-    fi
-    log "小时数据解析完成，共 ${#hour_map[@]} 条记录"
-
-    # 从今天北京时间 00:00 到上一个完整小时
-    local today_bj=$(TZ=Asia/Shanghai date +%Y-%m-%d)
-    local start_ts=$(TZ=Asia/Shanghai date -d "$today_bj 00:00:00" +%s)
-    local end_ts=$(TZ=Asia/Shanghai date -d '1 hour ago' +%s)
-    end_ts=$(( end_ts - end_ts % 3600 ))
-
-    local ts=$start_ts
-    while [ "$ts" -le "$end_ts" ]; do
-        local bj_date=$(TZ=Asia/Shanghai date -d "@$ts" +%Y-%m-%d)
-        local bj_h=$(TZ=Asia/Shanghai date -d "@$ts" +%H)
-        local bj_hour=$(printf "%02d:00" "$bj_h")
-
-        # 换算成服务器本地时间去查表
-        local local_ts=$((ts - BJ_DIFF * 3600))
-        local local_date=$(date -d "@$local_ts" +%Y-%m-%d)
-        local local_hour=$(date -d "@$local_ts" +%H)
-
-        local rx_mb=0 tx_mb=0 total_mb=0
-        local key="${local_date}_${local_hour}"
-        if [ -n "${hour_map[$key]}" ]; then
-            local data="${hour_map[$key]}"
-            local rx=$(echo "$data" | cut -d'|' -f1)
-            local tx=$(echo "$data" | cut -d'|' -f2)
-            local typ=$(echo "$data" | cut -d'|' -f3)
-            if [ "$typ" = "json" ]; then
-                rx_mb=$(bytes_to_mb "$rx")
-                tx_mb=$(bytes_to_mb "$tx")
-            else
-                rx_mb=$(fix_zero "$(val_to_mb "$rx")")
-                tx_mb=$(fix_zero "$(val_to_mb "$tx")")
-            fi
-            total_mb=$(fix_zero "$(echo "$rx_mb + $tx_mb" | $BC)")
-        fi
-
-        [ "$first" = "0" ] && hours_json+=","
-        hours_json+="{\"key\":\"$bj_date $bj_hour\",\"date\":\"$bj_date\",\"hour\":\"$bj_hour\",\"rx_mb\":$rx_mb,\"tx_mb\":$tx_mb,\"total_mb\":$total_mb}"
-        first=0
-        ts=$((ts + 3600))
-    done
-    hours_json+="]"
-    echo "$hours_json"
-}
-
-HOURLY_DATA=$(collect_hourly)
-log "小时流量数据生成完成"
+load_daily
 
 # ---------- 计算流量 ----------
 if [ "$REPORT_TYPE" = "hourly" ]; then
-    TODAY_TS=$(date +%s)
-    TOTAL_MB=$(calc_period "$TODAY_TS")
-    USED_GB=$(fix_zero $(echo "scale=2;$TOTAL_MB/1024" | $BC))
+    HOURLY_DATA=$(collect_hourly)
+    log "小时流量数据生成完成"
+
+    TOTAL_MB=$(calc_period "$(date +%s)")
+    USED_GB=$(fix_zero "$(echo "scale=2;$TOTAL_MB/1024" | $BC)")
     PCT=$(calc_pct "$USED_GB" "$MAX_GB")
     DISP_RX="-"
     DISP_TX="-"
@@ -362,15 +305,25 @@ if [ "$REPORT_TYPE" = "hourly" ]; then
     YEST_GB="-"
     log "实时上报 - 周期累计: ${USED_GB}GB (${PCT}%)"
 else
-    YEST_TS=$(date -d "yesterday" +%s)
-    TOTAL_PERIOD_MB=$(calc_period "$YEST_TS")
-    USED_GB=$(fix_zero $(echo "scale=2;$TOTAL_PERIOD_MB/1024" | $BC))
+    YEST_D=$(date -d yesterday +%Y-%m-%d)
+    TOTAL_PERIOD_MB=$(calc_period "$(date -d yesterday +%s)")
+    USED_GB=$(fix_zero "$(echo "scale=2;$TOTAL_PERIOD_MB/1024" | $BC)")
     PCT=$(calc_pct "$USED_GB" "$MAX_GB")
+
+    # 昨日真实流量
     YEST_GB="0.00"
-    TODAY_GB="-"
     DISP_RX="0.00 GB"
     DISP_TX="0.00 GB"
-    log "日报 - 周期累计: ${USED_GB}GB (${PCT}%)"
+    data="${DAY_MAP[$YEST_D]}"
+    if [ -n "$data" ]; then
+        calc_day_mb "$data"
+        YEST_GB=$(fix_zero "$(echo "scale=2;$MODE_ADD/1024" | $BC)")
+        DISP_RX="$(fix_zero "$(echo "scale=2;$MODE_RX_MB/1024" | $BC)") GB"
+        DISP_TX="$(fix_zero "$(echo "scale=2;$MODE_TX_MB/1024" | $BC)") GB"
+    else
+        log "昨日 ($YEST_D) 无数据"
+    fi
+    log "日报 - 周期累计: ${USED_GB}GB (${PCT}%), 昨日: ${YEST_GB}GB"
 fi
 
 # ---------- 发送 Telegram 日报 ----------
@@ -392,8 +345,8 @@ if [ "$REPORT_TYPE" = "daily" ]; then
     for ((i=0; i<FILLED; i++)); do BAR+="$BLOCK"; done
     for ((i=0; i<EMPTY; i++)); do BAR+="⬜"; done
 
-    MSG=$(printf "📊 *流量日报*\n\n🆔 设备：\`%s\`\n💻 主机：*%s*\n🛜 地址：\`%s\`\n\n⬇️ 下载：\`%s\`\n⬆️ 上传：\`%s\`\n📈 模式：\`%s\`\n\n🧮 昨日：\`%s GB\`\n\n📅 周期：\`%s ~ %s\`\n🔄 重置：每月 %s 号\n\n⏳ 累计：\`%s / %s GB\`\n🎯 进度：%s \`%d%%\`\n\n🕙 \`%s\`" \
-        "$DEVICE_ID" "$HOST_ALIAS" "$SERVER_IP" "$DISP_RX" "$DISP_TX" "$MODE_NAME" \
+    MSG=$(printf "📊 *流量日报*\n\n💻 主机：*%s*\n🛜 地址：\`%s\`\n\n⬇️ 下载：\`%s\`\n⬆️ 上传：\`%s\`\n📈 模式：\`%s\`\n\n🧮 昨日：\`%s GB\`\n\n📅 周期：\`%s ~ %s\`\n🔄 重置：每月 %s 号\n\n⏳ 累计：\`%s / %s GB\`\n🎯 进度：%s \`%d%%\`\n\n🕙 \`%s\`" \
+        "$HOST_ALIAS" "$SERVER_IP" "$DISP_RX" "$DISP_TX" "$MODE_NAME" \
         "$YEST_GB" "$START_DATE" "$END_DATE" "$RESET_DAY" "$USED_GB" "$MAX_GB" "$BAR" "$PCT" "$NOW")
 
     RESP=$($CL --connect-timeout 10 --retry 3 -s \
@@ -488,10 +441,14 @@ collect_config() {
     TG_TOKEN=${input_val:-$TG_TOKEN}
     read -p "🆔 Chat ID [${TG_CHAT_ID}]: " input_val
     TG_CHAT_ID=${input_val:-$TG_CHAT_ID}
-    read -p "📅 重置日 (1-31) [${RESET_DAY}]: " input_val
-    RESET_DAY=${input_val:-$RESET_DAY}
-    read -p "📊 限额 (GB) [${MAX_GB}]: " input_val
-    MAX_GB=${input_val:-$MAX_GB}
+    read -p "📅 重置日 (1-31) [${RESET_DAY:-1}]: " input_val
+    RESET_DAY=${input_val:-${RESET_DAY:-1}}
+    [[ "$RESET_DAY" =~ ^[0-9]+$ ]] || RESET_DAY=1
+    (( RESET_DAY < 1 )) && RESET_DAY=1
+    (( RESET_DAY > 31 )) && RESET_DAY=31
+    read -p "📊 限额 (GB) [${MAX_GB:-2000}]: " input_val
+    MAX_GB=${input_val:-${MAX_GB:-2000}}
+    [[ "$MAX_GB" =~ ^[0-9.]+$ ]] || MAX_GB=2000
     echo ""
     echo "📈 流量统计方式"
     echo " 1. 入+出（默认）  2. 仅入站  3. 仅出站  4. 入/出取大"
@@ -533,11 +490,15 @@ EOF
     chmod 600 "$CONFIG_FILE"
     generate_report_logic
 
-    # 设置 cron
-    H=$(echo "$RUN_TIME" | cut -d: -f1 | sed 's/^0//')
-    M=$(echo "$RUN_TIME" | cut -d: -f2 | sed 's/^0//')
-    [ -z "$H" ] && H=0
-    [ -z "$M" ] && M=0
+    # 设置 cron（10# 去前导零，兼容 08/09 等写法）
+    H=${RUN_TIME%%:*}
+    M=${RUN_TIME##*:}
+    [[ "$H" =~ ^[0-9]+$ ]] || H=1
+    [[ "$M" =~ ^[0-9]+$ ]] || M=30
+    H=$((10#$H))
+    M=$((10#$M))
+    (( H > 23 )) && H=23
+    (( M > 59 )) && M=59
 
     (crontab -l 2>/dev/null | grep -Fv "$BIN_PATH daily"; \
      echo "$M $H * * * /bin/bash $BIN_PATH daily >> /tmp/vnstat_tg.log 2>&1") | crontab -
@@ -600,7 +561,7 @@ while true; do
             ;;
         6)
             (crontab -l 2>/dev/null | grep -v "$BIN_PATH") | crontab -
-            rm -f "$BIN_PATH" "$CONFIG_FILE"
+            rm -f "$BIN_PATH" "$CONFIG_FILE" /tmp/vnstat_tg.log
             echo "✅ 已卸载"
             sleep 2
             ;;
