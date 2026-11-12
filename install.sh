@@ -1,7 +1,7 @@
 #!/bin/bash
 # =================================================================
 # 名称: 流量统计 & TG 管理工具
-# 版本: v4.7
+# 版本: v4.8 (修复时区转换错位 Bug)
 # 功能:
 #   - 每日 Telegram 流量日报（含昨日真实下载/上传）
 #   - 每小时上报到 Cloudflare Worker（北京时间上一个完整小时）
@@ -10,7 +10,7 @@
 #   - 自动日志轮转
 #   - 兼容任意服务器时区
 # =================================================================
-VERSION="v4.7"
+VERSION="v4.8"
 CONFIG_FILE="/etc/vnstat_tg.conf"
 BIN_PATH="/usr/local/bin/vnstat_tg_report.sh"
 
@@ -235,16 +235,20 @@ collect_hourly() {
     done < <($VN -h 2>/dev/null)
     log "小时数据解析完成，共 ${#hour_map[@]} 条记录"
 
-    # 北京时间上一个完整小时
+    # 【修复核心】获取上一个完整小时的绝对时间戳 (epoch)
     local bj_ts=$(TZ=Asia/Shanghai date -d '1 hour ago' +%s)
     bj_ts=$(( bj_ts - bj_ts % 3600 ))
+
+    # 1. 生成上报给 Worker 的北京时间字段
     local bj_date=$(TZ=Asia/Shanghai date -d "@$bj_ts" +%Y-%m-%d)
     # date +%H 本身已是两位零填充，直接拼接，避免 printf %d 把 08/09 当八进制
     local bj_hour="$(TZ=Asia/Shanghai date -d "@$bj_ts" +%H):00"
 
-    # 换算成服务器本地时间去查表
-    local local_ts=$((bj_ts - BJ_DIFF * 3600))
-    local key="$(date -d "@$local_ts" +%Y-%m-%d)_$(date -d "@$local_ts" +%H)"
+    # 2. 生成用于查 vnstat 表的系统本地时间
+    # vnstat 是按你服务器当前时区记录的，所以直接用绝对时间戳转换即可，千万不能再减去时差！
+    local local_date=$(date -d "@$bj_ts" +%Y-%m-%d)
+    local local_hour=$(date -d "@$bj_ts" +%H)
+    local key="${local_date}_${local_hour}"
 
     local rx_mb=0 tx_mb=0 total_mb=0
     if [ -n "${hour_map[$key]}" ]; then
@@ -256,7 +260,7 @@ collect_hourly() {
         log "未找到 $key 的小时数据，按 0 处理"
     fi
 
-    log "上个小时: 北京时间 $bj_date $bj_hour (本地 $key) rx=${rx_mb}MB tx=${tx_mb}MB"
+    log "上个小时: 北京时间 $bj_date $bj_hour (本地查表 $key) rx=${rx_mb}MB tx=${tx_mb}MB"
     echo "[{\"key\":\"$bj_date $bj_hour\",\"date\":\"$bj_date\",\"hour\":\"$bj_hour\",\"rx_mb\":$rx_mb,\"tx_mb\":$tx_mb,\"total_mb\":$total_mb}]"
 }
 
@@ -268,13 +272,13 @@ case "$TRAFFIC_MODE" in
     *) MODE_NAME="入+出" ;;
 esac
 
-# 计算本地时区到北京时间的小时差
+# 计算本地时区到北京时间的小时差 (仅供日志展示)
 LOCAL_OFFSET=$(date +%z)
 LOCAL_SIGN="${LOCAL_OFFSET:0:1}"
 LOCAL_H=$((10#${LOCAL_OFFSET:1:2}))
 [ "$LOCAL_SIGN" = "-" ] && LOCAL_H=$((-LOCAL_H))
 BJ_DIFF=$((8 - LOCAL_H))
-log "时区差值 BJ_DIFF=$BJ_DIFF 小时"
+log "时区差值 BJ_DIFF=$BJ_DIFF 小时 (仅供展示，不影响查表)"
 
 NOW=$(date "+%Y-%m-%d %H:%M")
 NOW_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
