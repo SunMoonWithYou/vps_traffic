@@ -1,7 +1,7 @@
 #!/bin/bash
 # =================================================================
 # 名称: 流量统计 & TG 管理工具
-# 版本: v4.6
+# 版本: v4.7
 # 功能:
 #   - 每日 Telegram 流量日报（含昨日真实下载/上传）
 #   - 每小时上报到 Cloudflare Worker（北京时间上一个完整小时）
@@ -9,18 +9,8 @@
 #   - 设备唯一编码
 #   - 自动日志轮转
 #   - 兼容任意服务器时区
-#
-# v4.6 变更:
-#   - 移除 vnstat JSON 解析分支（实测 vnStat 2.x 输出为单行 JSON，
-#     逐行解析不可行，且 --json 1 参数本身无效；统一使用文本输出）
-#   - 日报中「昨日/下载/上传」改为真实计算，不再固定 0.00
-#   - 小时数据解析仅在 hourly 模式执行，日报不再重复解析
-#   - 修复 calc_pct 除零、去除已弃用的 vnstat -u 调用
-#   - 配置录入增加 RESET_DAY/MAX_GB 合法性校验与默认值
-#   - 卸载时清理日志文件；cron 时间解析更健壮
-#   - 大幅减少解析过程中的子进程调用（grep 循环改为纯 bash 正则）
 # =================================================================
-VERSION="v4.6"
+VERSION="v4.7"
 CONFIG_FILE="/etc/vnstat_tg.conf"
 BIN_PATH="/usr/local/bin/vnstat_tg_report.sh"
 
@@ -249,7 +239,8 @@ collect_hourly() {
     local bj_ts=$(TZ=Asia/Shanghai date -d '1 hour ago' +%s)
     bj_ts=$(( bj_ts - bj_ts % 3600 ))
     local bj_date=$(TZ=Asia/Shanghai date -d "@$bj_ts" +%Y-%m-%d)
-    local bj_hour=$(printf "%02d:00" "$(TZ=Asia/Shanghai date -d "@$bj_ts" +%H)")
+    # date +%H 本身已是两位零填充，直接拼接，避免 printf %d 把 08/09 当八进制
+    local bj_hour="$(TZ=Asia/Shanghai date -d "@$bj_ts" +%H):00"
 
     # 换算成服务器本地时间去查表
     local local_ts=$((bj_ts - BJ_DIFF * 3600))
@@ -444,6 +435,7 @@ collect_config() {
     read -p "📅 重置日 (1-31) [${RESET_DAY:-1}]: " input_val
     RESET_DAY=${input_val:-${RESET_DAY:-1}}
     [[ "$RESET_DAY" =~ ^[0-9]+$ ]] || RESET_DAY=1
+    RESET_DAY=$((10#$RESET_DAY))   # 归一化，避免 08/09 被当作八进制
     (( RESET_DAY < 1 )) && RESET_DAY=1
     (( RESET_DAY > 31 )) && RESET_DAY=31
     read -p "📊 限额 (GB) [${MAX_GB:-2000}]: " input_val
